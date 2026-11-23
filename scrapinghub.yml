@@ -1,0 +1,6 @@
+# Replace 000000 with your Scrapy Cloud project id.
+# Pin a dated stack in production, e.g. scrapy:2.12-20250101.
+project: 000000
+stack: scrapy:2.12
+requirements:
+  file: requirements.txt

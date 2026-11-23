@@ -1,0 +1,5 @@
+# Keep the scrapy:2.12 stack version: newer Scrapy (pulled in by recent
+# scrapy-zyte-api) breaks Scrapy Cloud's sh_scrapy HubstorageSpiderMiddleware.
+scrapy>=2.12,<2.13
+scrapy-zyte-api>=0.34
+python-dateutil>=2.9
