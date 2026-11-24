@@ -31,16 +31,28 @@ Everything below ports what the PDP's JavaScript does with that response:
   (`<smart string>_<n>.png`; see `_image_sort_key`). Magento's resized
   `/cache/<hash>/` copy is mapped to the full-size original, which is also what
   the site does for its own drawing download.
-- The DOWNLOADS drawer is not in the markup until it is opened. Its buttons, in
-  order, and where each one's URL comes from:
-    "Specifications Sheet"   no URL exists: the button prints a React component
-                             in the browser (react-to-print). Column kept, blank.
+- The DOWNLOADS drawer is not in the markup until it is opened. Its buttons, and
+  where each one's URL comes from:
     "Installation Sheet"     hf_installation_instructions, a JSON list of paths
                              on the Pimcore CDN. With more than one entry the
-                             buttons are "Installation Sheet 1", "... 2", etc.
+                             page numbers the buttons ("Installation Sheet 1",
+                             "... 2"); here they share one column, ';'-joined
+                             in button order.
     "Dimensional Drawing"    the gallery image numbered 5.
+    "Specifications Sheet"   no URL exists: the button prints a React component
+                             in the browser (react-to-print). What it prints is
+                             the data below.
   CAD / Revit / Images buttons only render for signed-in trade accounts and
   are not part of the public drawer, so they are not collected.
+- `spec-data` is the tabbed block at #specifications, as JSON keyed by tab (see
+  `_spec_data`). Tabs and rows vary per product, and some rows (Overall Height,
+  Product Weight, ...) per configuration. "Details" always shows; "Lamping" and
+  "Features" only when they have content. "Shipping & Facts" is limited to
+  Hubbardton's own customer-service logins and is not collected.
+  The page reads a variant's values from its `custom_attributes`, which is up to
+  17 MB per PDP for all variants. The same values are available as flat fields,
+  with select attributes as option ids; those are resolved through one
+  customAttributeMetadata request made before the crawl starts.
 """
 
 import json
@@ -49,6 +61,8 @@ import re
 from urllib.parse import urlsplit
 
 import scrapy
+import scrapy.exceptions
+from parsel import Selector
 from scrapy.downloadermiddlewares.retry import get_retry_request
 from scrapy.http import JsonRequest, Request
 from w3lib.url import safe_url_string
@@ -77,6 +91,73 @@ _LISTING_META = {
     }
 }
 
+# #specifications: variant attributes the Details and Lamping tabs read, with the
+# label the page shows for those that are rendered under their own label.
+_VARIANT_SPECS = {
+    "hf_width": "Width",
+    "hf_height": "Height",
+    "hf_depth_length": "Depth",
+    "hf_diameter": "Diameter",
+    "hf_mounting_heighthorizontal": "Mounting Height - Horizontal",
+    "hf_mounting_heightvertical": "Mounting Height - Vertical",
+    "hf_mounting_direction": "Mounting Direction",
+    "hf_chain_included": "Chain Included",
+    "hf_directto_joist_caution": None,
+    "hf_pipe_length_min": None,
+    "hf_pipe_length_max": None,
+    "hf_backplate_width": None,
+    "hf_backplate_height": None,
+    "hf_lamping": None,
+    "hf_bulb_type1": None,
+    "hf_bulb_watt1": None,
+    "hf_bulbincluded": None,
+    "hf_socket_qpa1": None,
+    "hf_socket_qpa2": None,
+    "hf_socket_type_fluorescent": None,
+    "hf_bulb_type1_fluorescent": None,
+    "hf_voltage_fluorescent": None,
+    "hf_socket_qpa1_fluorescent": None,
+    "hf_bulbincluded_fluorescent": None,
+    "hf_sloped_ceiling": None,
+    "hf_socket_type": "Socket Type",
+    "hf_led": "LED",
+    "hf_delivered_lumens": "Delivered Lumens",
+    "hf_cct": "CCT",
+    "hf_cri": "CRI",
+    "hf_input": "Input",
+    "hf_dimming": "Dimming",
+    "hf_voltage": "Voltage",
+    "hf_location_rating_ul": "Location Rating UL",
+    "hf_safety_rating": "Safety Rating",
+}
+
+# Base-item values the page reads as flat fields (already display text).
+_BULB1_FIELDS = (
+    "hf_item_number", "hf_manufacturer", "hf_base", "hf_wattage", "hf_type_or_shape",
+    "hf_color_temp", "hf_qty_per_product", "hf_included",
+)
+_BULB2_FIELDS = (
+    "hf_bulb2item_number", "hf_bulb2manufacturer", "hf_bulb2base", "hf_bulb2wattage",
+    "hf_bulb2type_or_shape", "hf_bulb2color_temp", "hf_bulb2qty_per_product", "hf_bulb2included",
+)
+_PARENT_SPECS = _BULB1_FIELDS + _BULB2_FIELDS + (
+    "hf_canopy_width", "hf_canopy_height", "hf_canopy_depth", "hf_canopy_backplate_shape",
+    "hf_shade_material", "hf_shade_shape", "hf_shade_width", "hf_shade_height", "hf_shade_depth",
+    "hf_post_shape", "hf_post_width", "hf_post_depth",
+    "hf_lamp_base_shape", "hf_lamp_base_width", "hf_lamp_base_height", "hf_lamp_base_depth",
+    "hf_feature_bullet1", "hf_feature_bullet2", "hf_feature_bullet3", "hf_feature_bullet4",
+    "hf_feature_bullet5", "hf_prop65",
+)
+# Base-item attributes listed as bullets on the Features tab.
+_FEATURE_CODES = {
+    "hf_option1", "hf_lamping", "hf_adacompliant", "hf_sloped_ceiling",
+    "hf_dark_sky_friendly", "hf_patent", "hf_turtle_friendly",
+}
+
+METADATA_QUERY = "query hubbardtonMetadata { customAttributeMetadata(attributes: [%s]) { items { attribute_code attribute_options { label value } } } }" % ", ".join(
+    '{ attribute_code: "%s", entity_type: "catalog_product" }' % code for code in _VARIANT_SPECS
+)
+
 PRODUCT_QUERY = """
 query hubbardtonProduct($urlKey: String!) {
   storeConfig { pimcore_assets_host }
@@ -88,22 +169,31 @@ query hubbardtonProduct($urlKey: String!) {
       url_key
       hf_installation_instructions
       media_gallery { url }
+      short_description { html }
+      %s
+      custom_attributes {
+        attribute_metadata { code label }
+        entered_attribute_value { value }
+        selected_attribute_options { attribute_option { label } }
+      }
       ... on ConfigurableProduct {
         configurable_options { attribute_code }
         variants {
           attributes { code value_index }
           product {
             sku
+            weight
             hf_smart_string
             hf_installation_instructions
             media_gallery { url }
+            %s
           }
         }
       }
     }
   }
 }
-"""
+""" % (" ".join(_PARENT_SPECS), " ".join(_VARIANT_SPECS))
 
 _CACHE_RE = re.compile(r"/cache/[^/]+/")
 # First "<anything without _ or />_<digits>" path segment, as in the bundle.
@@ -186,23 +276,227 @@ def _carousel(product, variant=None, is_default=True):
 
 
 def _downloads(product, configured, assets_host):
-    """{button label: url} for the DOWNLOADS drawer of one configuration."""
-    out = {"Specifications Sheet": ""}  # browser print job, has no URL
-
+    """{column: url(s)} for the DOWNLOADS drawer of one configuration."""
     raw = configured.get("hf_installation_instructions")
     try:
         paths = json.loads(raw) if raw else []
     except ValueError:
         logger.warning("[%s] unreadable hf_installation_instructions: %r", configured.get("sku"), raw)
         paths = []
-    paths = [p for p in paths or [] if isinstance(p, str)]
-    for i, path in enumerate(paths, 1):
-        label = "Installation Sheet" if len(paths) == 1 else f"Installation Sheet {i}"
-        out[label] = safe_url_string(assets_host + path)
-
+    sheets = [safe_url_string(assets_host + p).replace(";", "%3B") for p in paths or [] if isinstance(p, str)]
     drawing = next((u for u in _media_urls(product) if _image_number(u) == 5), None)
-    if drawing:
-        out["Dimensional Drawing"] = _original_image(drawing)
+    return {
+        "Installation Sheet": ";".join(dict.fromkeys(sheets)),
+        "Dimensional Drawing": _original_image(drawing) if drawing else "",
+    }
+
+
+# ------------------------------------------------------------ spec-data
+_FLOAT_RE = re.compile(r"\s*[-+]?(?:\d+\.?\d*|\.\d+)")
+
+
+def _number(value):
+    """JS parseFloat, as display text ('58.100000' -> '58.1'); '' if not a number."""
+    match = _FLOAT_RE.match(str(value if value is not None else ""))
+    return f"{float(match.group(0)):.6f}".rstrip("0").rstrip(".") if match else ""
+
+
+def _int(value):
+    match = re.match(r"\s*[-+]?\d+", value or "")
+    return int(match.group(0)) if match else 0
+
+
+def _dims(product, *fields):
+    """('hf_x_width', 'W'), ... -> '44.5”W x 1.7”H x 8.5”D'."""
+    return " x ".join(f"{product[f]}”{letter}" for f, letter in fields if product.get(f))
+
+
+def _html_text(html):
+    return _clean(" ".join(Selector(text=html).xpath("//text()").getall())) if _clean(html) else ""
+
+
+def _parent_attributes(product):
+    """Base item custom_attributes in page order: code -> (label, entered, [option labels])."""
+    out = {}
+    for attr in product.get("custom_attributes") or []:
+        meta = attr.get("attribute_metadata") or {}
+        entered = (attr.get("entered_attribute_value") or {}).get("value")
+        chosen = (attr.get("selected_attribute_options") or {}).get("attribute_option") or []
+        out.setdefault(meta.get("code"), (_clean(meta.get("label")), entered, [_clean(o["label"]) for o in chosen]))
+    return out
+
+
+def _details_tab(product, parent, spec, weight):
+    rows = []
+    if spec("hf_directto_joist_caution") == "Yes":
+        rows.append((
+            "Caution!",
+            "The weight of this fixture requires direct-to-joist, beam or overlay attachment "
+            "independent of the electrical joist box.",
+        ))
+
+    def dimension(code, unit='"'):
+        number = _number(spec(code))
+        rows.append((_VARIANT_SPECS[code], number + unit if number else ""))
+
+    if spec("hf_diameter"):
+        dimension("hf_height")
+        dimension("hf_diameter")
+    else:
+        dimension("hf_width")
+        dimension("hf_height")
+        dimension("hf_depth_length")
+    if weight:
+        rows.append(("Product Weight", f"{_number(weight)} lbs"))
+    low, high = spec("hf_pipe_length_min"), spec("hf_pipe_length_max")
+    if low and high:
+        rows.append(("Overall Height", f'{low}" to {high}"'))
+    tall, wide = spec("hf_backplate_height"), spec("hf_backplate_width")
+    if tall and wide:
+        rows.append(("Backplate", f'{tall}" x {wide}"'))
+    dimension("hf_mounting_heighthorizontal")
+    dimension("hf_chain_included", "'")
+    for code in ("hf_mounting_heightvertical", "hf_mounting_direction"):
+        rows.append((_VARIANT_SPECS[code], spec(code)))
+
+    def base(code):
+        return next(iter(parent.get(code, ("", None, []))[2]), "")
+
+    rows += [
+        ("Canopy", _dims(product, ("hf_canopy_width", "W"), ("hf_canopy_height", "H"), ("hf_canopy_depth", "D"))),
+        ("Canopy / Backplate Shape", product.get("hf_canopy_backplate_shape")),
+        ("Glass/Shade QPA", base("hf_glass_shade_qpa")),
+        ("Shade Material", product.get("hf_shade_material")),
+        ("Shade Shape", product.get("hf_shade_shape")),
+        ("Shade", _dims(product, ("hf_shade_width", "W"), ("hf_shade_height", "H"), ("hf_shade_depth", "D"))),
+        ("Post Shape", product.get("hf_post_shape")),
+        ("Post", _dims(product, ("hf_post_width", "W"), ("hf_post_depth", "D"))),
+        ("Lamp Base Shape", product.get("hf_lamp_base_shape")),
+        ("Lamp Base", _dims(product, ("hf_lamp_base_width", "W"), ("hf_lamp_base_height", "H"), ("hf_lamp_base_depth", "D"))),
+        ("Fixture Material", base("hf_fixture_material")),
+        ("Number of Arms", base("hf_numberof_arms")),
+        ("Number of Tiers", base("hf_numberof_tiers")),
+    ]
+    return rows
+
+
+def _lamping_tab(spec):
+    rows = []
+
+    def attribute(code, suffix=""):
+        value = spec(code)
+        rows.append((_VARIANT_SPECS[code], value + suffix if value else ""))
+
+    lamping = spec("hf_lamping")
+    if "FLU" in lamping:
+        rows.append(("Socket", spec("hf_socket_type_fluorescent")))
+        rows.append(("Bulb", spec("hf_bulb_type1_fluorescent")))
+        rows.append(("Voltage", spec("hf_voltage_fluorescent")))
+        bulbs = spec("hf_socket_qpa1_fluorescent")
+        if bulbs:
+            # The page tests that the attribute has a label at all, so "No"
+            # also reads as included.
+            included = "included" if spec("hf_bulbincluded_fluorescent") else "not included"
+            rows.append(("Number of Bulbs", f"{bulbs} ({included})"))
+    else:
+        bulb, watt = spec("hf_bulb_type1"), spec("hf_bulb_watt1")
+        if lamping == "LED" and "GU24" in bulb:
+            rows.append(("Lamping", "Retrofit"))
+        elif spec("hf_led"):
+            rows.append(("Lamping", "Dedicated"))
+        attribute("hf_socket_type")
+        rows.append(("Bulb", ", ".join(x for x in (bulb, f"{watt} Max" if watt else "") if x)))
+        count = _int(spec("hf_socket_qpa1")) + _int(spec("hf_socket_qpa2"))
+        if count > 0:
+            included = "included" if spec("hf_bulbincluded") == "Yes" else "not included"
+            rows.append(("Number of Bulbs", f"{count} ({included})"))
+        for code in ("hf_led", "hf_delivered_lumens", "hf_cct", "hf_cri", "hf_input", "hf_dimming"):
+            attribute(code)
+        attribute("hf_voltage", "V")
+    attribute("hf_location_rating_ul")
+    attribute("hf_safety_rating", " listed")
+    return rows
+
+
+def _recommended_bulb(product, parent, fields):
+    """Rows follow the base item's attribute order, labels lose their 'Bulb 2'."""
+    return [
+        (_clean(re.sub(r"Bulb\s*\d+", "", label)), product.get(code))
+        for code, (label, _, _) in parent.items()
+        if code in fields
+    ]
+
+
+def _features_tab(product, parent):
+    configurable = {o["attribute_code"] for o in product.get("configurable_options") or []}
+    rows = []
+    for code, (label, entered, options) in parent.items():
+        if code not in _FEATURE_CODES or code in configurable:
+            continue
+        option = options[0] if options else ""
+        if (
+            (code == "hf_lamping" and "None" in option)
+            or (code in ("hf_adacompliant", "hf_dark_sky_friendly") and option.lower() == "no")
+            or (code == "hf_sloped_ceiling" and option.lower() in ("no", "no (0)"))
+            or (code == "hf_patent" and (entered or "").lower() == "no")
+        ):
+            continue
+        # Patent has no options: the page prints only the bare label, but its
+        # data carries the patent number (or "Pending"), so keep that.
+        rows.append((label, option or _clean(entered) or "Yes"))
+
+    description = _html_text((product.get("short_description") or {}).get("html"))
+    if not rows and not description:
+        return []  # the page leaves the tab out
+    rows.insert(0, ("Description", description))
+    rows.append(("Notes", [n for n in (_clean(product.get(f"hf_feature_bullet{i}")) for i in range(1, 6)) if n]))
+    if product.get("hf_prop65"):
+        rows.append(("California Residents", "Prop 65 regulations"))
+    return rows
+
+
+def _spec_data(product, configured, options):
+    """{tab: {label: value}} as the #specifications tabs show it, in page order.
+
+    `options` is {attribute code: {option id: label}}. Rows the page renders
+    without a value are left out. The Lamping tab's bulb blocks get their own
+    key because they repeat labels ("Wattage", "Base", ...).
+    """
+    parent = _parent_attributes(product)
+
+    def spec(code):
+        raw = configured.get(code)
+        if raw is None or raw == "":
+            return ""
+        labels = options.get(code)
+        if not labels:
+            return _clean(str(raw))
+        ids = str(raw).split(",")
+        for option_id in ids:
+            if option_id not in labels:
+                logger.error("[%s] %s: unknown option id %s", configured.get("sku"), code, option_id)
+        # Multi-selects are listed in the attribute's option order.
+        return ", ".join(label for option_id, label in labels.items() if option_id in ids)
+
+    lamping = _lamping_tab(spec)
+    # A row that is never displayed (Sloped Ceiling) still makes the tab show.
+    has_lamping = any(v for _, v in lamping) or spec("hf_sloped_ceiling")
+    tabs = [("Details", _details_tab(product, parent, spec, configured.get("weight")))]
+    if has_lamping:
+        tabs += [
+            ("Lamping", lamping),
+            ("Recommended Bulb 1", _recommended_bulb(product, parent, _BULB1_FIELDS)),
+            ("Recommended Bulb 2", _recommended_bulb(product, parent, _BULB2_FIELDS)),
+        ]
+    tabs.append(("Features", _features_tab(product, parent)))
+
+    out = {}
+    for tab, rows in tabs:
+        rows = {
+            label: value if isinstance(value, list) else _clean(str(value)) for label, value in rows if value
+        }
+        if rows:
+            out[tab] = rows
     return out
 
 
@@ -227,7 +521,7 @@ class HubbardtonForgeSpider(scrapy.Spider):
         self._seen_keys = set()
         self._scraped_keys = set()
         self._seen_sku = {}
-        self._unknown_labels = set()
+        self._options = {}
 
     # Scrapy >= 2.13 drives spiders through `start()`; the Scrapy Cloud stack
     # (scrapy:2.12) only knows `start_requests()`. Define both.
@@ -236,11 +530,34 @@ class HubbardtonForgeSpider(scrapy.Spider):
             yield request
 
     def start_requests(self):
+        yield JsonRequest(
+            GRAPHQL_URL, data={"query": METADATA_QUERY}, callback=self.parse_metadata, errback=self.on_error
+        )
+
+    def parse_metadata(self, response):
+        """Option labels for `spec-data`; the crawl starts once they are in."""
+        try:
+            items = response.json()["data"]["customAttributeMetadata"]["items"]
+            self._options = {
+                item["attribute_code"]: {o["value"]: _clean(o["label"]) for o in item["attribute_options"]}
+                for item in items
+                if item and item.get("attribute_options")
+            }
+        except (ValueError, KeyError, TypeError) as exc:
+            logger.warning("attribute metadata unreadable: %r", exc)
+        if not self._options:
+            retry = get_retry_request(response.request, spider=self, reason="no attribute metadata")
+            if retry:
+                yield retry
+            else:
+                raise scrapy.exceptions.CloseSpider("no attribute metadata")
+            return
+
         if self.products:
             for key in self.products:
                 yield self._product_request(key, LISTING_URL.format(page=1))
-            return
-        yield self._listing_request(1)
+        else:
+            yield self._listing_request(1)
 
     # -------------------------------------------------------------- listing
     def _listing_request(self, page, last_page=None):
@@ -369,11 +686,13 @@ class HubbardtonForgeSpider(scrapy.Spider):
         if first != page["url"]:
             logger.warning("[dup] %s on %s already emitted from %s", sku, page["url"], first)
             return
-        downloads = _downloads(product, configured, assets_host)
-        for label in downloads.keys() - set(HUBBARDTONFORGE_FIELDS) - self._unknown_labels:
-            self._unknown_labels.add(label)
-            logger.error("download column %r is not in HUBBARDTONFORGE_FIELDS; CSV export will drop it", label)
-        yield {"sku": sku, "images": ";".join(images), **downloads, **page}
+        yield {
+            "sku": sku,
+            "images": ";".join(images),
+            "spec-data": json.dumps(_spec_data(product, configured, self._options), ensure_ascii=False),
+            **_downloads(product, configured, assets_host),
+            **page,
+        }
 
     # --------------------------------------------------------------- errors
     def on_error(self, failure):

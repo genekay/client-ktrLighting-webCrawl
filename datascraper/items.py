@@ -92,21 +92,13 @@ LUMECON_FIELDS = [
 
 
 # Hubbardton Forge: one row per selectable option combination ("configured
-# item") of every PDP under /products. The download columns are the literal
-# DOWNLOADS drawer button names; a PDP has either one "Installation Sheet" or
-# several numbered ones (6 is the most seen across the catalog).
+# item") of every PDP under /products.
 HUBBARDTONFORGE_FIELDS = [
-    "sku",     # "Configured Item #"; primary key
-    "images",  # carousel left to right for that configuration, full-size, ';'-joined
-    "Specifications Sheet",  # always blank: the button is a browser print job, not a file
-    "Installation Sheet",
-    "Installation Sheet 1",
-    "Installation Sheet 2",
-    "Installation Sheet 3",
-    "Installation Sheet 4",
-    "Installation Sheet 5",
-    "Installation Sheet 6",
-    "Dimensional Drawing",
+    "sku",        # "Configured Item #"; primary key
+    "images",     # carousel left to right for that configuration, full-size, ';'-joined
+    "spec-data",  # #specifications tabs as JSON: {"Details": {label: value}, "Lamping": {...}, ...}
+    "Installation Sheet",   # DOWNLOADS drawer; ';'-joined when the drawer lists several
+    "Dimensional Drawing",  # DOWNLOADS drawer
     "url",
     "title",
     "cate_url",
